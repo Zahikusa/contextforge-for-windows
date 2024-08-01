@@ -13,6 +13,10 @@ from pathlib import Path
 import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import re
+import os
+from pathlib import Path
+import fnmatch
 
 class ContextForgeHandler(FileSystemEventHandler):
     def __init__(self, project_path, output_file, output_format, max_file_size, allowed_extensions):
@@ -55,8 +59,15 @@ def watch_project(project_path, output_file, output_format='markdown', max_file_
 
 def get_file_content(file_path):
     """Read and return the content of a file."""
-    with open(file_path, 'r', encoding='utf-8') as file:
-        return file.read()
+    encodings = ['utf-8', 'iso-8859-1', 'windows-1252']
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as file:
+                return file.read()
+        except UnicodeDecodeError:
+            continue
+    print(f"Failed to read file: {file_path}")
+    return f"Unable to read file due to encoding issues: {file_path}"
 
 def is_binary(file_path):
     """Check if a file is binary."""
@@ -180,69 +191,51 @@ def get_language(file_extension):
     return extension_map.get(file_extension.lower(), '')
 
 def load_cfignore(project_path):
-    """Load and parse the .cfignore file."""
-    cfignore_path = os.path.join(project_path, '.cfignore')
+    cfignore_path = Path(project_path) / '.cfignore'
     ignore_patterns = []
-    if os.path.exists(cfignore_path):
-        with open(cfignore_path, 'r') as f:
+    if cfignore_path.exists():
+        with cfignore_path.open('r') as f:
             ignore_patterns = [line.strip() for line in f if line.strip() and not line.startswith('#')]
     return ignore_patterns
 
 def should_ignore(path, ignore_patterns, output_file, allowed_extensions):
-    """Check if a file or directory should be ignored based on .cfignore patterns, output file, and allowed extensions."""
-    # Normalize paths for consistent comparison
     path = Path(path).resolve()
     if output_file:
         output_file = Path(output_file).resolve()
 
-    # Check if the path is the output file
-    if output_file:
-        if path.exists() and output_file.exists() and path.samefile(output_file):
-            return True
-        # If the output file doesn't exist yet, compare the normalized paths
-        if path == output_file:
-            return True
+    if output_file and (path == output_file or (path.exists() and output_file.exists() and path.samefile(output_file))):
+        return True
     
-    # Get the relative path from the project root
     rel_path = path.relative_to(Path.cwd())
     
     for pattern in ignore_patterns:
-        # Remove leading and trailing whitespace and slashes
         pattern = pattern.strip().strip('/')
-        
-        # Convert pattern to Path object for easier manipulation
         pattern_path = Path(pattern)
-        
-        # Check if the pattern is meant to match from the root
         is_root_pattern = pattern.startswith('/')
         
-        # Create different variations of the path to check against
         paths_to_check = [
             str(rel_path),
             str(path),
-            str(rel_path).lstrip('./'),
+            str(rel_path).lstrip('./').lstrip('.\\'),  # Corrected line
             path.name,
             *(str(rel_path.relative_to(part)) for part in rel_path.parents if part != Path('.'))
         ]
         
         for check_path in paths_to_check:
-            # For root patterns, only check against the full relative path
-            if is_root_pattern and check_path != str(rel_path).lstrip('./'):
+            check_path = check_path.replace('\\', '/')
+            if is_root_pattern and check_path != str(rel_path).lstrip('./').lstrip('.\\'): # Corrected line
                 continue
             
-            # Perform the pattern matching
-            if fnmatch.fnmatch(check_path, pattern) or \
-               fnmatch.fnmatch(check_path, f"{pattern}/*") or \
-               (pattern_path.parts and fnmatch.fnmatch(check_path, str(Path('**') / pattern))):
+            if fnmatch.fnmatch(check_path.lower(), pattern.lower()) or \
+               fnmatch.fnmatch(check_path.lower(), f"{pattern.lower()}/*") or \
+               (pattern_path.parts and fnmatch.fnmatch(check_path.lower(), str(Path('**') / pattern).lower())):
                 return True
     
-    # If not ignored by patterns, check file extension (if allowed_extensions is specified)
     if allowed_extensions is not None:
         if path.is_file():
-            if path.suffix.lstrip('.') not in allowed_extensions:
+            if path.suffix.lstrip('.').lower() not in (ext.lower() for ext in allowed_extensions):
                 return True
         elif path.is_dir():
-            # Don't ignore directories when filtering by extension
             return False
 
     return False
@@ -253,7 +246,6 @@ def count_tokens(text):
     return len(enc.encode(text))
 
 def process_file(file_info):
-    """Process a single file and return its content and token count."""
     file_path, relative_path, ignore_patterns, max_file_size, output_file, allowed_extensions = file_info
     
     if should_ignore(file_path, ignore_patterns, output_file, allowed_extensions):
@@ -296,7 +288,6 @@ def compile_project(project_path, output_file, output_format='markdown', max_fil
     with ThreadPoolExecutor() as executor:
         future_to_file = {}
         for root, dirs, files in os.walk(project_path):
-            # Check and remove ignored directories
             dirs[:] = [d for d in dirs if not should_ignore(os.path.join(root, d), ignore_patterns, output_file, None)]
             
             for file in files:
@@ -370,7 +361,7 @@ def compile_project(project_path, output_file, output_format='markdown', max_fil
                 file_path = content.split("\n", 2)[0].replace("## File: ", "").strip()
                 
                 source = ET.SubElement(document, "source")
-                source.text = file_path
+                source.text = sanitize_for_xml(file_path)
                 
                 document_content = ET.SubElement(document, "document_content")
                 
@@ -382,8 +373,8 @@ def compile_project(project_path, output_file, output_format='markdown', max_fil
                 if cleaned_content.strip().startswith("```") and cleaned_content.strip().endswith("```"):
                     cleaned_content = "\n".join(cleaned_content.split("\n")[1:-1])
                 
-                document_content.text = cleaned_content.strip()
-            
+                document_content.text = sanitize_for_xml(cleaned_content.strip())
+        
             xml_str = minidom.parseString(ET.tostring(root)).toprettyxml(indent="  ")
             out_file.write(xml_str)
 
@@ -394,6 +385,11 @@ def compile_project(project_path, output_file, output_format='markdown', max_fil
     print(f"- Total tokens: {total_tokens}")
     print(f"- Compilation time: {compilation_time:.2f} seconds")
     print(f"AI-ready context saved to {output_file}")
+
+def sanitize_for_xml(text):
+    # XPATH: //*[not(self::text()) and not(self::*)]
+    illegal_xml_chars = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1F\uD800-\uDFFF\uFFFE\uFFFF]')
+    return illegal_xml_chars.sub('', text)
 
 def main():
     parser = argparse.ArgumentParser(
